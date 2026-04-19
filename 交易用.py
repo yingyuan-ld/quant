@@ -326,9 +326,9 @@ def my_buy(context, data):
             print("股票：",stock,"准备金额：", to_buy, "当前价格：",current_price,"限价：", cap_price, "购买数量：",amount)
             # 上证（.SS）委托市价单时须传保护限价，深证（.SZ）可不传
             if stock.endswith('.SS'):
-                order_market(stock, amount, 0, cap_price)
+                order_market(stock, amount, 4, cap_price)
             else:
-                order_market(stock, amount, 0)
+                order_market(stock, amount, 4)
             # order_value(stock, to_buy)
             if stock not in context.portfolio.positions:
                 position_count += 1
