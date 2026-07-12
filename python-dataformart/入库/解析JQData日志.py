@@ -9,12 +9,18 @@ import re
 import sys
 from pathlib import Path
 
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
+from paths import DAILY_DIR, LOGS_DIR
+
 BEGIN_RE = re.compile(r"JQDATA_BEGIN\|(\d{4}-\d{2}-\d{2})")
 END_RE = re.compile(r"JQDATA_END\|(\d{4}-\d{2}-\d{2})")
 PART_RE = re.compile(r"JQDATA_PART\|(\d{4}-\d{2}-\d{2})\|(\d+)\|(\d+)\|(.*)")
 
-DEFAULT_LOG = Path(__file__).resolve().parent / "JQData" / "logs" / "2023-01-01_2024-12-31.txt"
-DEFAULT_OUT = Path(__file__).resolve().parent / "JQData" / "daily"
+DEFAULT_LOG = LOGS_DIR / "2023-01-01_2024-12-31.txt"
+DEFAULT_OUT = DAILY_DIR
 
 
 def daily_json_path(out_dir: Path, date: str) -> Path:

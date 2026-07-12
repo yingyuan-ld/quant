@@ -11,8 +11,13 @@ from pathlib import Path
 
 import websocket
 
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
+from paths import LOGS_DIR
+
 JQ_URL_KEY = "joinquant.com/algorithm"
-LOGS_DIR = Path(__file__).resolve().parent / "JQData" / "logs"
 CHUNK_SIZE = 3_000_000
 CDP = "http://127.0.0.1:9222"
 

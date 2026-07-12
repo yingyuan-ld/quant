@@ -7,10 +7,13 @@ import json
 import sys
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+_PKG_ROOT = Path(__file__).resolve().parent.parent
+if str(_PKG_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PKG_ROOT))
+
+from paths import LOGS_DIR
 
 JQ_URL_KEY = "joinquant.com/algorithm"
-LOGS_DIR = Path(__file__).resolve().parent / "JQData" / "logs"
 CHUNK_SIZE = 3_000_000
 
 
