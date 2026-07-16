@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+from playwright.sync_api import sync_playwright
+
 _PKG_ROOT = Path(__file__).resolve().parent.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
