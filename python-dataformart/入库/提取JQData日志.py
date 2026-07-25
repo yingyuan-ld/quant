@@ -44,29 +44,35 @@ def scroll_logs(page) -> dict:
           const tab = document.querySelector('#daily-logs-tab');
           const getStats = () => {
             const text = tab ? tab.innerText : '';
-            const ends = [...new Set([...text.matchAll(/JQDATA_END\\|(\\d{4}-\\d{2}-\\d{2})/g)].map(m => m[1]))].sort();
-            const begins = [...new Set([...text.matchAll(/JQDATA_BEGIN\\|(\\d{4}-\\d{2}-\\d{2})/g)].map(m => m[1]))].sort();
+            const endRe = /(?:JQDATA_END|JQMIN_END)\\|(\\d{4}-\\d{2}-\\d{2})/g;
+            const beginRe = /(?:JQDATA_BEGIN|JQMIN_BEGIN)\\|(\\d{4}-\\d{2}-\\d{2})/g;
+            const ends = [...new Set([...text.matchAll(endRe)].map(m => m[1]))].sort();
+            const begins = [...new Set([...text.matchAll(beginRe)].map(m => m[1]))].sort();
             const incomplete = begins.filter(d => !ends.includes(d));
+            const jqminParts = (text.match(/JQMIN_PART\\|/g) || []).length;
+            const jqminBegin = (text.match(/JQMIN_BEGIN\\|/g) || []).length;
             return {
               logLen: text.length,
               count: ends.length,
               firstEnd: ends[0] || null,
               lastEnd: ends[ends.length - 1] || null,
               incompleteCount: incomplete.length,
+              jqminBegin,
+              jqminParts,
             };
           };
           if (!container) return getStats();
           let prev = getStats();
-          for (let round = 0; round < 10; round++) {
+          for (let round = 0; round < 15; round++) {
             let stable = 0;
-            for (let i = 0; i < 100; i++) {
+            for (let i = 0; i < 120; i++) {
               container.scrollTop = container.scrollHeight;
               container.dispatchEvent(new Event('scroll', { bubbles: true }));
               await new Promise(r => setTimeout(r, 50));
               const cur = getStats();
               if (cur.lastEnd === prev.lastEnd && cur.logLen === prev.logLen) {
                 stable++;
-                if (stable >= 6) break;
+                if (stable >= 8) break;
               } else {
                 stable = 0;
                 prev = cur;

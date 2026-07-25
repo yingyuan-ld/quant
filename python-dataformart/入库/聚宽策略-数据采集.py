@@ -1,316 +1,547 @@
 # -*- coding: utf-8 -*-
 """
-聚宽策略 - Plan-A 数据采集（日志输出版）
+聚宽 · 分钟级全市场数据采集（按分钟截面入库）
 
-用途：按 JQData/schema.json 方案 A 格式，采集「聚宽策略.py」所需的全部远端数据，
-      通过 log.info 输出 JSON，回测结束后复制日志到本地解析。
+参考：入库/joinquant-api/主要API速查.md
 
-使用方式：
-  1. 上传到聚宽研究/回测环境
-  2. 设置回测日期范围（如 2025-01-01 ~ 2025-12-31）
-  3. 每日 14:50 自动采集并打印日志
-  4. 回测结束后，复制日志内容保存为本地 .md 或 .txt
-  5. 运行: python quant/python-dataformart/入库/解析JQData日志.py 日志文件.txt
+重要：聚宽环境只能靠日志导出数据（无可靠文件下载）。
+      本脚本把「每个分钟的全市场截面」做成与本地落盘一致的 JSON：
+        {_meta: {trade_date, time, ...}, bars: {code: {ohlcv...}}}
+      再 zlib + base64 分片写入 log.info。
+      回测结束后用本地脚本抽日志再解析，不要在网页里「打开全部日志」（会卡死）。
 
-日志输出说明（按顺序）：
-  ① 采集开始提示          → 打印当前交易日期
-  ② JQDATA_BEGIN|日期     → JSON 数据块开始标记（解析用，勿删）
-  ③ JQDATA_PART|日期|...  → JSON 正文分片（拼合后即为 daily/年/日期.json）
-  ④ JQDATA_END|日期       → JSON 数据块结束标记（解析用，勿删）
-  ⑤ 采集完成摘要          → 打印各阶段股票数量和 JSON 总大小
+流程：
+  1. 上传本文件到聚宽回测，设日期区间
+  2. 每日 15:00：按股票批拉取 → 折成 minutes[time][code]
+     → 按分钟发出 JQMIN_*（键=HHMM）+ 可选日频 JQMIN_*(键=daily)
+  3. 本地：提取JQData日志.py 保存日志 txt
+  4. 本地：python 解析JQData分钟日志.py 日志.txt
+     → JQData/minute/年/日期/HHMM.json
+     → JQData/daily_snap/年/日期.json
 
-格式说明：见 quant/JQData/schema.json
+建议：
+  - 先 MAX_STOCKS=20 验证
+  - 全市场用 STOCK_SHARDS=4~8 分多次回测（日志更小、网页更不易炸）
+  - STOCK_BATCH_SIZE 默认 40（仅影响 API 拉取批大小，落盘仍按分钟）
 """
 
 from jqdata import *
 import json
+import math
 import datetime
-import numpy as np
+import zlib
+import base64
 
-# ========== 与 聚宽策略.py 保持一致 ==========
-TRADE_DAYS = 300          # 上市满多少天才纳入股票池
-PB_MIN = 0.01             # 市净率下限
-PB_MAX = 30               # 市净率上限
-INC_1D = 0.087            # 1日涨幅上限（8.7%），超过则过滤
-INDEX_CODE = '000001.XSHG'  # 牛熊择时用的上证指数
-MA_DAYS = 10              # 上证几日均线
-MINUTE_BARS = 1200        # 约5个交易日的1分钟K线根数
-CLOSE_BARS = 61           # 61根日K，用于计算60日涨幅
-RANK_POOL_LIMIT = 100     # 精选池最多100只
-CANDIDATE_LIMIT = 1000    # 候选池最多1000只
-SCHEMA_VERSION = '1.0.0'
-PLAN = 'A'
-LOG_CHUNK_SIZE = 6000     # 单条日志最大字符数，避免聚宽截断
+# ======================== 可配置 ========================
+BAR_FIELDS = ['open', 'high', 'low', 'close', 'volume', 'money']
+MINUTE_BARS = 240
+
+# API 拉取批大小（与落盘维度无关）
+STOCK_BATCH_SIZE = 40
+MAX_STOCKS = 0                # >0 只采前 N 只；全市场=0
+STOCK_SHARDS = 1              # 全市场建议 4~8，多次跑
+SHARD_ID = 0
+
+COLLECT_DAILY_SNAP = True
+COLLECT_INDEX_MINUTE = True
+INDEX_CODE = '000001.XSHG'
+SECURITY_TYPES = ['stock']
+
+FQ_NONE = None
+SCHEMA_VERSION = '2.3.0'
+PLAN = 'M'
+LOG_CHUNK_SIZE = 5000
+ZLIB_LEVEL = 6
 
 
 def initialize(context):
     set_option('use_real_price', True)
-    # 14:50 执行：此时分钟成交量、61日K线均已可用，与交易策略 14:47 精选时点接近
-    run_daily(collect_plan_a_data, '14:50')
+    log.info('Minute采集(按分钟截面) batch=%s max=%s shard=%s/%s' % (
+        STOCK_BATCH_SIZE, MAX_STOCKS, SHARD_ID, STOCK_SHARDS))
+    log.info('提示: 勿在网页展开全部日志；用本地提取脚本保存后再解析')
+    run_daily(collect_minute_data, time='15:00', reference_security='000300.XSHG')
 
 
-def collect_plan_a_data(context):
+def collect_minute_data(context):
     trade_date = context.current_dt.strftime('%Y-%m-%d')
-    prev_date = context.previous_date
-    check_date = prev_date - datetime.timedelta(days=TRADE_DAYS)
+    prev_date = context.previous_date.strftime('%Y-%m-%d')
+    fetched_at = context.current_dt.strftime('%Y-%m-%d %H:%M:%S')
+    end_dt = datetime.datetime(
+        context.current_dt.year, context.current_dt.month, context.current_dt.day, 15, 0, 0
+    )
+    start_dt = datetime.datetime(
+        context.current_dt.year, context.current_dt.month, context.current_dt.day, 9, 0, 0
+    )
 
-    # 【日志①】采集开始提示，方便在日志里定位每一天的数据块
-    log.info('===== Plan-A 数据采集开始: %s =====' % trade_date)
+    all_codes = list(get_all_securities(types=SECURITY_TYPES, date=trade_date).index)
+    all_codes = _apply_shard(sorted(all_codes))
+    if MAX_STOCKS > 0:
+        all_codes = all_codes[:MAX_STOCKS]
 
-    # ------------------------------------------------------------------
-    # 步骤1：拉取股票池（对应 聚宽策略.py → get_all_securities）
-    # 写入 payload._meta.pool_size
-    # ------------------------------------------------------------------
-    pool = list(get_all_securities(date=check_date).index)
-    pool_size = len(pool)
+    batches = _chunk(all_codes, STOCK_BATCH_SIZE)
+    batch_total = len(batches)
 
-    # ------------------------------------------------------------------
-    # 步骤2：拉取候选股基本面（对应 get_fundamentals 初筛）
-    # PB 在 0.01~30 之间，按流通市值升序取前 1000 只
-    # 后续写入 payload.candidates（约1000只股票）
-    # ------------------------------------------------------------------
-    q_candidates = query(
-        valuation.code,
-        valuation.pb_ratio,
-        valuation.circulating_market_cap,
-        valuation.market_cap,
-    ).filter(
-        valuation.code.in_(pool),
-        valuation.pb_ratio.between(PB_MIN, PB_MAX),
-    ).order_by(
-        valuation.circulating_market_cap.asc()
-    ).limit(CANDIDATE_LIMIT)
+    log.info('Minute开始 %s stocks=%s api_batches=%s end_dt=%s layout=by_minute' % (
+        trade_date, len(all_codes), batch_total, end_dt))
 
-    fund_df = get_fundamentals(q_candidates).dropna()
-    candidate_codes = list(fund_df['code'])
+    # minutes[time][code] = {open,high,low,close,volume,money}
+    minutes = {}
+    merged_daily = {}
+    curr_data = get_current_data() if COLLECT_DAILY_SNAP else None
 
-    # ------------------------------------------------------------------
-    # 步骤3：拉取实时快照（对应 get_current_data）
-    # 字段：name, day_open, high_limit, low_limit, last_price, is_st, paused
-    # 写入 payload.candidates.{code} 各字段
-    # ------------------------------------------------------------------
-    curr_data = get_current_data()
+    if COLLECT_INDEX_MINUTE:
+        idx_bars = fetch_minute_bars([INDEX_CODE], start_dt, end_dt)
+        fold_series_to_minutes(idx_bars, minutes)
+        log.info('指数分钟已折入 %s' % INDEX_CODE)
 
-    # ------------------------------------------------------------------
-    # 步骤4：拉取候选股 2 日收盘价（对应 history(2, '1d', 'close')）
-    # 用于计算 1 日涨跌幅 pct_change_1d，供后续过滤和写入 candidates
-    # ------------------------------------------------------------------
-    h2 = history(2, '1d', 'close', candidate_codes)
-    pct_1d = h2.pct_change().iloc[-1] if len(h2) >= 2 else None
+    for batch_index, batch in enumerate(batches, start=1):
+        log.info('拉取 %s %s/%s n=%s' % (trade_date, batch_index, batch_total, len(batch)))
+        series = fetch_minute_bars(batch, start_dt, end_dt)
+        fold_series_to_minutes(series, minutes)
+        if COLLECT_DAILY_SNAP:
+            merged_daily.update(fetch_daily_snap(batch, trade_date, prev_date, curr_data))
 
-    # 组装 candidates 字典：每只股票一条记录，key 为股票代码
-    candidates = {}
-    for _, row in fund_df.iterrows():
-        code = row['code']
-        cd = curr_data[code]
-        close_2d = _build_close_2d(h2, code)
-        pct = None
-        if pct_1d is not None and code in pct_1d.index:
-            val = pct_1d[code]
-            if val == val:  # 过滤 NaN
-                pct = float(val)
+    times = sorted(minutes.keys())
+    minute_total = len(times)
+    log.info('折算完成 %s minutes=%s stocks≈%s ，开始按分钟写日志' % (
+        trade_date, minute_total,
+        max((len(minutes[t]) for t in times), default=0)))
 
-        candidates[code] = {
-            'code': code,
-            'name': cd.name,                                    # 股票名称
-            'pb_ratio': _f(row['pb_ratio']),                    # 市净率
-            'circulating_market_cap': _f(row['circulating_market_cap']),  # 流通市值(亿)
-            'market_cap': _f(row['market_cap']),                # 总市值(亿)
-            'day_open': _f(cd.day_open),                        # 开盘价
-            'high_limit': _f(cd.high_limit),                    # 涨停价
-            'low_limit': _f(cd.low_limit),                      # 跌停价
-            'last_price': _f(cd.last_price),                    # 最新价
-            'is_st': bool(cd.is_st),                            # 是否ST
-            'paused': bool(cd.paused),                          # 是否停牌
-            'close_2d': close_2d,                               # 近2日收盘价
-            'pct_change_1d': pct,                               # 1日涨跌幅
-        }
-
-    # ------------------------------------------------------------------
-    # 步骤5：过滤候选股（对应 get_stock_list 中的过滤逻辑）
-    # 剔除：涨跌停开盘、停牌、ST、创业板、科创板、1日涨幅>=8.7%
-    # 过滤后的数量写入 payload._meta.filtered_count
-    # ------------------------------------------------------------------
-    filtered_codes = _filter_stocks(candidate_codes, curr_data, pct_1d)
-
-    # ------------------------------------------------------------------
-    # 步骤6：拉取精选池（对应 get_stock_rank_m_m 中的 get_fundamentals）
-    # 从过滤后的列表中，取流通市值最小的 100 只
-    # 后续写入 payload.rank_pool（约100只股票）
-    # ------------------------------------------------------------------
-    rank_q = query(
-        valuation.code,
-        valuation.circulating_market_cap,
-        valuation.market_cap,
-    ).filter(
-        valuation.code.in_(filtered_codes),
-    ).order_by(
-        valuation.circulating_market_cap.asc()
-    ).limit(RANK_POOL_LIMIT)
-
-    rank_df = get_fundamentals(rank_q).dropna()
-    rank_codes = list(rank_df['code'])
-
-    # ------------------------------------------------------------------
-    # 步骤7：拉取精选池分钟成交量（对应 history(1200, '1m', 'volume').sum()）
-    # 只存汇总值 volume_5d_sum，不存1200根原始K线
-    # ------------------------------------------------------------------
-    vol5d = history(MINUTE_BARS, '1m', 'volume', rank_codes).sum()
-
-    # ------------------------------------------------------------------
-    # 步骤8：拉取精选池 61 日收盘价（对应 get_bars(61, '1d', 'close')）
-    # 用于计算 60 日涨幅 inc_60d 和最新价 last_close
-    # ------------------------------------------------------------------
-    h61 = get_bars(rank_codes, CLOSE_BARS, '1d', ['close'], include_now=True)
-
-    rank_pool = {}
-    for _, row in rank_df.iterrows():
-        code = row['code']
-        close_list = _extract_close_list(h61, code)
-        inc_60d = None
-        if len(close_list) >= CLOSE_BARS and close_list[0]:
-            inc_60d = close_list[-1] / close_list[0]
-
-        rank_pool[code] = {
-            'code': code,
-            'circulating_market_cap': _f(row['circulating_market_cap']),  # 流通市值(亿)
-            'market_cap': _f(row['market_cap']),                          # 总市值(亿)
-            'last_close': close_list[-1] if close_list else None,         # 最新收盘价
-            'close_61d': close_list,                                      # 61日收盘价数组
-            'inc_60d': inc_60d,                                           # 60日涨幅
-            'volume_5d_sum': _f(vol5d[code]) if code in vol5d.index else None,  # 5日成交量之和
-        }
-
-    # ------------------------------------------------------------------
-    # 步骤9：拉取上证指数 10 日收盘价（对应 get_bull_bear_signal_minute）
-    # 写入 payload._index，用于牛熊择时
-    # ------------------------------------------------------------------
-    index_close = get_bars(INDEX_CODE, MA_DAYS, '1d', 'close', include_now=True)['close']
-    index_list = [float(x) for x in index_close]
-
-    # ------------------------------------------------------------------
-    # 步骤10：组装完整 JSON（即本地 daily/年/YYYY-MM-DD.json 的内容）
-    #
-    # payload 结构：
-    #   _meta        → 元信息（日期、各阶段数量、采集时间）
-    #   _index       → 上证指数10日K线（牛熊择时）
-    #   candidates   → 候选股池 ~1000只（盘前初筛用）
-    #   rank_pool    → 精选股池 ~100只（14:47多因子打分用）
-    # ------------------------------------------------------------------
-    payload = {
-        '_meta': {
-            'version': SCHEMA_VERSION,
-            'plan': PLAN,
-            'trade_date': trade_date,                               # 交易日期
-            'prev_trade_date': prev_date.strftime('%Y-%m-%d'),      # 上一交易日
-            'check_date': check_date.strftime('%Y-%m-%d'),          # 上市天数筛选基准日
-            'strategy': '聚宽策略.py',
-            'pool_size': pool_size,                                 # 股票池总数
-            'candidate_count': len(candidates),                     # 候选股数量
-            'filtered_count': len(filtered_codes),                  # 过滤后数量
-            'rank_pool_count': len(rank_pool),                      # 精选池数量
-            'fetched_at': context.current_dt.strftime('%Y-%m-%d %H:%M:%S'),
-        },
-        '_index': {
-            'code': INDEX_CODE,
-            'close_10d': index_list,        # 近10日收盘价
-            'close_last': index_list[-1] if index_list else None,
-            'ma_10': float(np.mean(index_list)) if index_list else None,  # 10日均线
-        },
-        'candidates': candidates,
-        'rank_pool': rank_pool,
+    base_meta = {
+        'version': SCHEMA_VERSION,
+        'plan': PLAN,
+        'layout': 'by_minute',
+        'freq': '1m',
+        'fields': list(BAR_FIELDS),
+        'fq': 'none',
+        'encoding': 'zlib_b64',
+        'trade_date': trade_date,
+        'prev_trade_date': prev_date,
+        'fetched_at': fetched_at,
+        'start_dt': start_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'end_dt': end_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'shard_id': SHARD_ID,
+        'shard_total': STOCK_SHARDS,
+        'api': 'get_bars|get_price',
+        'minute_total': minute_total,
     }
 
-    # ------------------------------------------------------------------
-    # 步骤11：输出 JSON 到日志
-    # 【日志②③④】见 _log_json_payload 函数说明
-    # ------------------------------------------------------------------
-    content = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-    _log_json_payload(trade_date, content)
+    for i, t in enumerate(times):
+        bars = minutes[t]
+        hhmm = time_to_hhmm(t)
+        meta = dict(base_meta)
+        meta.update({
+            'time': t,
+            'hhmm': hhmm,
+            'minute_index': i,
+            'stock_count': len(bars),
+            'kind': 'minute',
+        })
+        # 与本地 HHMM.json 同构
+        payload = {'_meta': meta, 'bars': bars}
+        content = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        emit_log_payload(trade_date, hhmm, minute_total, content, len(bars))
 
-    # 【日志⑤】采集完成摘要：各阶段数量和 JSON 总大小，便于确认是否完整
-    size_kb = len(content.encode('utf-8')) / 1024.0
-    log.info('采集完成(日志输出): daily/%s/%s.json' % (trade_date[:4], trade_date))
-    log.info('  pool=%s candidates=%s filtered=%s rank_pool=%s size=%.1fKB' % (
-        pool_size, len(candidates), len(filtered_codes), len(rank_pool), size_kb))
+    if COLLECT_DAILY_SNAP and merged_daily:
+        daily_meta = dict(base_meta)
+        daily_meta.update({
+            'kind': 'daily',
+            'stock_count': len(merged_daily),
+            'time': None,
+            'hhmm': 'daily',
+        })
+        payload = {'_meta': daily_meta, 'daily': merged_daily}
+        content = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        emit_log_payload(trade_date, 'daily', 1, content, len(merged_daily))
+
+    log.info('Minute结束 %s minutes=%s shard=%s 请本地提取后运行 解析JQData分钟日志.py' % (
+        trade_date, minute_total, SHARD_ID))
 
 
-def _log_json_payload(trade_date, content):
+def fold_series_to_minutes(bars_by_code, minutes):
+    """{code: {time:[], open:[], ...}} → minutes[time][code] = {ohlcv}"""
+    for code, series in (bars_by_code or {}).items():
+        if not isinstance(series, dict):
+            continue
+        times = series.get('time') or []
+        for i, t in enumerate(times):
+            if not t:
+                continue
+            bar = {}
+            for f in BAR_FIELDS:
+                vals = series.get(f)
+                if isinstance(vals, list) and i < len(vals):
+                    bar[f] = vals[i]
+            if not bar:
+                continue
+            if t not in minutes:
+                minutes[t] = {}
+            minutes[t][str(code)] = bar
+
+
+def time_to_hhmm(t):
+    """'09:31' / datetime → '0931'"""
+    if t is None:
+        return ''
+    if hasattr(t, 'strftime'):
+        return t.strftime('%H%M')
+    s = str(t)
+    if ' ' in s:
+        s = s.split(' ')[-1]
+    if len(s) >= 5 and s[2] == ':':
+        return s[:2] + s[3:5]
+    return s.replace(':', '')
+
+
+# --------------------- 行情拉取（官方 API） ---------------------
+
+def fetch_minute_bars(codes, start_dt, end_dt):
     """
-    分片输出 JSON 到日志，本地用 解析JQData日志.py 还原为 daily/年/日期.json
+    拉取 [start_dt, end_dt] 的 1 分钟 OHLCV（股票×时间序列，随后折成分钟截面）。
 
-    打印内容：
-      JQDATA_BEGIN|2026-05-20
-        → 标记开始，后面紧跟该日的 JSON 分片
-
-      JQDATA_PART|2026-05-20|1|62|{"_meta":{...},"_index":{...},...
-        → 第1片/共62片，内容是 JSON 字符串的一段（需按序号拼合）
-
-      JQDATA_PART|2026-05-20|2|62|...}
-        → 第2片，依此类推
-
-      JQDATA_END|2026-05-20
-        → 标记结束，该日数据输出完毕
+    优先 get_bars；回退 get_price（end_date 必须带时分）。
     """
-    # 【日志②】开始标记
-    log.info('JQDATA_BEGIN|%s' % trade_date)
+    if not codes:
+        return {}
 
-    total = (len(content) + LOG_CHUNK_SIZE - 1) // LOG_CHUNK_SIZE
+    try:
+        raw = get_bars(
+            codes,
+            count=MINUTE_BARS,
+            unit='1m',
+            fields=['date'] + list(BAR_FIELDS),
+            include_now=True,
+            end_dt=end_dt,
+            fq_ref_date=FQ_NONE,
+            df=True,
+        )
+        parsed = bars_from_bars_df(raw, codes)
+        if parsed:
+            return parsed
+        log.info('get_bars 解析为空，尝试 get_price')
+    except Exception as e:
+        log.info('get_bars 失败: %s ，尝试 get_price' % e)
+
+    try:
+        df = get_price(
+            codes,
+            start_date=start_dt,
+            end_date=end_dt,
+            frequency='1m',
+            fields=list(BAR_FIELDS),
+            skip_paused=False,
+            fq=FQ_NONE,
+            panel=False,
+            fill_paused=False,
+        )
+        return bars_from_price_df(df, codes)
+    except Exception as e:
+        log.info('get_price 失败: %s' % e)
+        return {}
+
+
+def bars_from_bars_df(df, codes):
+    """get_bars(df=True) → {code: {time, open, ...}}"""
+    out = {}
+    if df is None:
+        return out
+    try:
+        if len(df) == 0:
+            return out
+    except Exception:
+        return out
+
+    work = df.reset_index()
+    cols_lower = {str(c).lower(): c for c in work.columns}
+    rename = {}
+    if 'code' in cols_lower:
+        rename[cols_lower['code']] = 'code'
+    elif 'level_0' in cols_lower:
+        rename[cols_lower['level_0']] = 'code'
+    for key in ('date', 'time', 'datetime', 'level_1', 'index'):
+        if key in cols_lower:
+            rename[cols_lower[key]] = 'time'
+            break
+    if rename:
+        work = work.rename(columns=rename)
+
+    if 'time' not in work.columns:
+        return out
+
+    if 'code' not in work.columns:
+        if len(codes) == 1:
+            work['code'] = codes[0]
+        else:
+            return out
+
+    for code, g in work.groupby('code'):
+        try:
+            g = g.sort_values('time')
+        except Exception:
+            pass
+        item = _row_to_bar_item(g)
+        if item is not None:
+            out[str(code)] = item
+    return out
+
+
+def bars_from_price_df(df, codes):
+    """get_price(panel=False) → {code: {time, open, ...}}"""
+    out = {}
+    if df is None:
+        return out
+    try:
+        if len(df) == 0:
+            return out
+    except Exception:
+        return out
+
+    work = df.reset_index()
+    cols_lower = {str(c).lower(): c for c in work.columns}
+    rename = {}
+    if 'code' in cols_lower:
+        rename[cols_lower['code']] = 'code'
+    elif 'level_0' in cols_lower:
+        rename[cols_lower['level_0']] = 'code'
+    for key in ('time', 'date', 'datetime', 'index', 'level_1'):
+        if key in cols_lower:
+            rename[cols_lower[key]] = 'time'
+            break
+    if rename:
+        work = work.rename(columns=rename)
+
+    if 'time' not in work.columns:
+        return out
+    if 'code' not in work.columns:
+        if len(codes) == 1:
+            work['code'] = codes[0]
+        else:
+            return out
+
+    for code, g in work.groupby('code'):
+        try:
+            g = g.sort_values('time')
+        except Exception:
+            pass
+        item = _row_to_bar_item(g)
+        if item is not None:
+            out[str(code)] = item
+    return out
+
+
+def _row_to_bar_item(g):
+    times = [fmt_time(t) for t in g['time'].tolist()]
+    item = {'time': times}
+    for f in BAR_FIELDS:
+        if f in g.columns:
+            item[f] = [to_float(x) for x in g[f].tolist()]
+        else:
+            item[f] = [None] * len(times)
+    if not any(x is not None for x in item['close']):
+        return None
+    return item
+
+
+# --------------------- 日频快照 ---------------------
+
+def fetch_daily_snap(codes, trade_date, prev_date, curr_data):
+    snap = {}
+    if not codes:
+        return snap
+
+    fund_map = load_valuation(codes, trade_date, prev_date)
+    day_map = load_daily_ohlcv(codes, trade_date)
+    close2_map = load_close_2d(codes, prev_date)
+
+    for code in codes:
+        cd = curr_data[code] if curr_data is not None else None
+        fund = fund_map.get(code)
+        day = day_map.get(code)
+        c2 = close2_map.get(code) or []
+        pct = None
+        if len(c2) >= 2 and c2[0] not in (None, 0):
+            try:
+                pct = float(c2[-1]) / float(c2[0]) - 1.0
+            except Exception:
+                pct = None
+
+        snap[code] = {
+            'code': code,
+            'name': getattr(cd, 'name', None) if cd is not None else None,
+            'day_open': to_float(getattr(cd, 'day_open', None)) if cd is not None else None,
+            'high_limit': to_float(getattr(cd, 'high_limit', None)) if cd is not None else None,
+            'low_limit': to_float(getattr(cd, 'low_limit', None)) if cd is not None else None,
+            'last_price': to_float(getattr(cd, 'last_price', None)) if cd is not None else None,
+            'is_st': bool(getattr(cd, 'is_st', False)) if cd is not None else None,
+            'paused': bool(getattr(cd, 'paused', False)) if cd is not None else None,
+            'pb_ratio': to_float(fund['pb_ratio']) if fund is not None else None,
+            'pe_ratio': to_float(fund['pe_ratio']) if fund is not None else None,
+            'circulating_market_cap': to_float(fund['circulating_market_cap']) if fund is not None else None,
+            'market_cap': to_float(fund['market_cap']) if fund is not None else None,
+            'open': to_float(day['open']) if day is not None else None,
+            'high': to_float(day['high']) if day is not None else None,
+            'low': to_float(day['low']) if day is not None else None,
+            'close': to_float(day['close']) if day is not None else None,
+            'volume': to_float(day['volume']) if day is not None else None,
+            'money': to_float(day['money']) if day is not None else None,
+            'close_2d': c2,
+            'pct_change_1d': pct,
+        }
+    return snap
+
+
+def load_valuation(codes, trade_date, prev_date):
+    fund_map = {}
+    for d in (trade_date, prev_date):
+        try:
+            q = query(
+                valuation.code,
+                valuation.pb_ratio,
+                valuation.pe_ratio,
+                valuation.circulating_market_cap,
+                valuation.market_cap,
+            ).filter(valuation.code.in_(codes))
+            df = get_fundamentals(q, date=d)
+            if df is not None and len(df) > 0:
+                for _, row in df.iterrows():
+                    fund_map[row['code']] = row
+                if fund_map:
+                    return fund_map
+        except Exception as e:
+            log.info('get_fundamentals(%s) 失败: %s' % (d, e))
+    return fund_map
+
+
+def load_daily_ohlcv(codes, trade_date):
+    day_map = {}
+    try:
+        df = get_price(
+            codes,
+            count=1,
+            end_date=trade_date,
+            frequency='daily',
+            fields=list(BAR_FIELDS),
+            skip_paused=False,
+            fq=FQ_NONE,
+            panel=False,
+            fill_paused=False,
+        )
+        if df is None or len(df) == 0:
+            return day_map
+        work = df.reset_index()
+        cols_lower = {str(c).lower(): c for c in work.columns}
+        if 'code' not in work.columns:
+            if 'level_0' in cols_lower:
+                work = work.rename(columns={cols_lower['level_0']: 'code'})
+            elif len(codes) == 1:
+                work['code'] = codes[0]
+        for _, row in work.iterrows():
+            if 'code' in row:
+                day_map[row['code']] = row
+    except Exception as e:
+        log.info('日线 get_price 失败: %s' % e)
+    return day_map
+
+
+def load_close_2d(codes, prev_date):
+    out = {}
+    try:
+        df = get_price(
+            codes,
+            count=2,
+            end_date=prev_date,
+            frequency='daily',
+            fields=['close'],
+            skip_paused=False,
+            fq=FQ_NONE,
+            panel=False,
+            fill_paused=False,
+        )
+        if df is None or len(df) == 0:
+            return out
+        work = df.reset_index()
+        cols_lower = {str(c).lower(): c for c in work.columns}
+        if 'code' not in work.columns:
+            if 'level_0' in cols_lower:
+                work = work.rename(columns={cols_lower['level_0']: 'code'})
+            elif len(codes) == 1:
+                work['code'] = codes[0]
+        if 'code' not in work.columns or 'close' not in work.columns:
+            return out
+        for code, g in work.groupby('code'):
+            closes = [to_float(x) for x in g['close'].tolist()]
+            out[str(code)] = closes[-2:] if len(closes) >= 2 else closes
+    except Exception as e:
+        log.info('close_2d 失败: %s' % e)
+    return out
+
+
+# --------------------- 输出（仅日志） ---------------------
+
+def emit_log_payload(trade_date, slot_key, slot_total, content, rows):
+    """
+    JSON → zlib → base64 → 分片 log。
+
+    标记（slot_key = HHMM 或 daily）：
+      JQMIN_BEGIN|日期|键|总数|zlib_b64|原始KB|压缩KB|rows
+      JQMIN_PART|日期|键|片号|总片|base64片段
+      JQMIN_END|日期|键|总数
+    """
+    raw_kb = len(content.encode('utf-8')) / 1024.0
+    packed = base64.b64encode(
+        zlib.compress(content.encode('utf-8'), ZLIB_LEVEL)
+    ).decode('ascii')
+    packed_kb = len(packed) / 1024.0
+
+    log.info('JQMIN_BEGIN|%s|%s|%s|zlib_b64|%.1f|%.1f|%s' % (
+        trade_date, slot_key, slot_total, raw_kb, packed_kb, rows))
+
+    total = max(1, (len(packed) + LOG_CHUNK_SIZE - 1) // LOG_CHUNK_SIZE)
     for i in range(total):
-        chunk = content[i * LOG_CHUNK_SIZE:(i + 1) * LOG_CHUNK_SIZE]
-        # 【日志③】JSON 正文分片：日期|当前片序号|总片数|JSON片段
-        log.info('JQDATA_PART|%s|%s|%s|%s' % (trade_date, i + 1, total, chunk))
+        chunk = packed[i * LOG_CHUNK_SIZE:(i + 1) * LOG_CHUNK_SIZE]
+        log.info('JQMIN_PART|%s|%s|%s|%s|%s' % (
+            trade_date, slot_key, i + 1, total, chunk))
 
-    # 【日志④】结束标记
-    log.info('JQDATA_END|%s' % trade_date)
-
-
-def _filter_stocks(stock_list, curr_data, pct_1d):
-    """与 聚宽策略.py get_stock_list 相同的过滤规则（不含 sold_stock）"""
-    stock_list = [s for s in stock_list if not (
-        (curr_data[s].day_open == curr_data[s].high_limit) or  # 涨停开盘
-        (curr_data[s].day_open == curr_data[s].low_limit) or    # 跌停开盘
-        curr_data[s].paused or                                   # 停牌
-        curr_data[s].is_st or                                   # ST
-        ('ST' in curr_data[s].name) or
-        ('*' in curr_data[s].name) or
-        ('退' in curr_data[s].name) or
-        s.startswith('300') or                                  # 创业板
-        s.startswith('301') or                                  # 创业板
-        s.startswith('688')                                     # 科创板
-    )]
-    if pct_1d is None:
-        return stock_list
-    return [s for s in stock_list if s in pct_1d.index and pct_1d[s] < INC_1D]
+    log.info('JQMIN_END|%s|%s|%s' % (trade_date, slot_key, slot_total))
 
 
-def _build_close_2d(h2, code):
-    """从2日收盘价 history 中提取 [前一日, 当日]"""
-    if code not in h2.columns:
+# --------------------- 工具 ---------------------
+
+def _apply_shard(codes):
+    if STOCK_SHARDS <= 1:
+        return codes
+    shard_id = max(0, min(SHARD_ID, STOCK_SHARDS - 1))
+    size = int(math.ceil(len(codes) / float(STOCK_SHARDS)))
+    start = shard_id * size
+    return codes[start:start + size]
+
+
+def _chunk(items, size):
+    if not items:
         return []
-    series = h2[code].dropna()
-    if series.empty:
-        return []
-    if len(series) >= 2:
-        return [float(series.iloc[-2]), float(series.iloc[-1])]
-    return [float(series.iloc[-1])]
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def _extract_close_list(h61, code):
-    """从61日 get_bars 结果中提取收盘价列表"""
-    if code not in h61:
-        return []
-    closes = h61[code]['close']
-    return [float(x) for x in closes]
+def fmt_time(t):
+    if t is None:
+        return ''
+    if hasattr(t, 'strftime'):
+        return t.strftime('%H:%M')
+    s = str(t)
+    if ' ' in s:
+        s = s.split(' ')[-1]
+    if len(s) >= 5 and s[2] == ':':
+        return s[:5]
+    return s
 
 
-def _f(value):
-    """float 转换，NaN 转为 None"""
+def to_float(value):
     if value is None:
         return None
     try:
-        if value != value:  # NaN
+        f = float(value)
+        if f != f:
             return None
+        return f
     except Exception:
-        pass
-    return float(value)
+        return None

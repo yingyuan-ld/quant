@@ -8,6 +8,8 @@ PKG_ROOT = Path(__file__).resolve().parent
 JQDATA_ROOT = QUANT_ROOT / "JQData"
 
 DAILY_DIR = JQDATA_ROOT / "daily"
+MINUTE_DIR = JQDATA_ROOT / "minute"
+DAILY_SNAP_DIR = JQDATA_ROOT / "daily_snap"
 LOGS_DIR = JQDATA_ROOT / "logs"
 
 INGEST_DIR = PKG_ROOT / "入库"
